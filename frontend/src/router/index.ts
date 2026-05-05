@@ -46,17 +46,11 @@ const router = createRouter({
           meta: { permission: 'analytics' }
         },
         {
-          path: 'chat',
-          name: 'chat',
-          component: () => import('@/views/chat/ChatView.vue'),
-          meta: { permission: 'chat' }
-        },
-        {
-          path: 'chat/:contactId',
+          path: 'chat/:contactId?',
           name: 'chat-conversation',
           component: () => import('@/views/chat/ChatView.vue'),
           props: true,
-          meta: { permission: 'chat' }
+          meta: { permission: 'chat', stableKey: true }
         },
         {
           path: 'profile',
@@ -198,6 +192,12 @@ const router = createRouter({
           path: 'settings/contacts',
           name: 'contacts',
           component: () => import('@/views/settings/ContactsView.vue'),
+          meta: { permission: 'contacts' }
+        },
+        {
+          path: 'settings/contacts/:id',
+          name: 'contact-detail',
+          component: () => import('@/views/settings/ContactDetailView.vue'),
           meta: { permission: 'contacts' }
         },
         {

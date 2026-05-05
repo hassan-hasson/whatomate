@@ -87,7 +87,7 @@ func (p *SLAProcessor) processOrganizationSLA(settings models.ChatbotSettings, n
 
 	// 3. Mark SLA breached for transfers past response deadline
 	if settings.SLA.ResponseMinutes > 0 {
-		p.markSLABreached(orgID, settings, now)
+		p.markSLABreached(orgID, now)
 	}
 
 	// 4. Handle client inactivity (reminders and auto-close)
@@ -240,7 +240,7 @@ func (p *SLAProcessor) escalateTransfers(orgID uuid.UUID, settings models.Chatbo
 }
 
 // markSLABreached marks transfers as SLA breached when past response deadline
-func (p *SLAProcessor) markSLABreached(orgID uuid.UUID, settings models.ChatbotSettings, now time.Time) {
+func (p *SLAProcessor) markSLABreached(orgID uuid.UUID, now time.Time) {
 	result := p.app.DB.Model(&models.AgentTransfer{}).Where(
 		"organization_id = ? AND status = ? AND sla_breached = ? AND sla_response_deadline IS NOT NULL AND sla_response_deadline < ? AND agent_id IS NULL",
 		orgID, models.TransferStatusActive, false, now,
@@ -565,12 +565,7 @@ func (p *SLAProcessor) autoCloseChatbotSession(contact models.Contact, settings 
 // UpdateContactChatbotMessage updates the chatbot last message timestamp for a contact
 func (a *App) UpdateContactChatbotMessage(contactID uuid.UUID) {
 	now := time.Now()
-	a.DB.Model(&models.Contact{}).
-		Where("id = ?", contactID).
-		Updates(map[string]any{
-			"chatbot_last_message_at": now,
-			"chatbot_reminder_sent":   false, // Reset reminder when chatbot sends a new message
-		})
+	a.DB.Exec("UPDATE contacts SET chatbot_last_message_at = ?, chatbot_reminder_sent = false WHERE id = ?", now, contactID)
 }
 
 // ClearContactChatbotTracking clears chatbot tracking when client replies or is transferred
