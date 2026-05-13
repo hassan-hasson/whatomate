@@ -7,7 +7,7 @@ import { useAuthStore } from '@/stores/auth'
 import { useUsersStore } from '@/stores/users'
 import { useTransfersStore } from '@/stores/transfers'
 import { wsService } from '@/services/websocket'
-import { contactsService, chatbotService, messagesService, customActionsService, accountsService, getRequestHeaders, type CustomAction, type ActionResult } from '@/services/api'
+import { contactsService, chatbotService, messagesService, customActionsService, accountsService, cannedResponsesService, getRequestHeaders, type CustomAction, type ActionResult, type CannedResponse } from '@/services/api'
 import { useTagsStore } from '@/stores/tags'
 import { TagBadge } from '@/components/ui/tag-badge'
 import { getTagColorClass } from '@/lib/constants'
@@ -90,6 +90,7 @@ import { getInitials, getAvatarGradient } from '@/lib/utils'
 import { useColorMode } from '@/composables/useColorMode'
 import { useInfiniteScroll } from '@/composables/useInfiniteScroll'
 import CannedResponsePicker from '@/components/chat/CannedResponsePicker.vue'
+import PreviewButtonGroup from '@/components/chatbot/flow-preview/PreviewButtonGroup.vue'
 import TemplatePicker from '@/components/chat/TemplatePicker.vue'
 import ContactInfoPanel from '@/components/chat/ContactInfoPanel.vue'
 import ConversationNotes from '@/components/chat/ConversationNotes.vue'
@@ -151,6 +152,16 @@ const isUploadingMedia = ref(false)
 // Canned responses slash command state
 const cannedPickerOpen = ref(false)
 const cannedSearchQuery = ref('')
+
+// Canned response preview dialog state
+const cannedDialogOpen = ref(false)
+const selectedCannedResponse = ref<CannedResponse | null>(null)
+const cannedParamNames = ref<string[]>([])
+const cannedParamValues = ref<Record<string, string>>({})
+const isSendingCanned = ref(false)
+// Tokens that the chat already knows how to fill from the current contact;
+// these stay out of the input list and are resolved straight into the preview.
+const AUTO_RESOLVED_CANNED_TOKENS = new Set(['contact_name', 'phone_number', 'user_name', 'agent_name'])
 
 // Sticky date header state
 const stickyDate = ref('')
@@ -528,7 +539,12 @@ watch(contactId, async (newId) => {
 })
 
 async function selectContact(id: string) {
-  const contact = contactsStore.contacts.find(c => c.id === id)
+  // Direct deep links to /chat/:id may target a contact that isn't in the
+  // currently-loaded (paginated) list — fall back to fetching it directly.
+  let contact = contactsStore.contacts.find(c => c.id === id)
+  if (!contact) {
+    contact = await contactsStore.fetchContact(id)
+  }
   if (contact) {
     // Reset unread pill — fetchMessages will mark everything read on the server
     newMessagesCount.value = 0
@@ -779,10 +795,152 @@ function scrollToMessage(messageId: string | undefined) {
   }
 }
 
-function insertCannedResponse(content: string) {
-  messageInput.value = content
+function extractCannedTokens(content: string): string[] {
+  const seen = new Set<string>()
+  const matches = content.matchAll(/\{\{\s*([\w.-]+)\s*\}\}/g)
+  for (const m of matches) seen.add(m[1])
+  return Array.from(seen)
+}
+
+// Collect tokens from the message body AND every button field, so the param
+// dialog prompts for custom tokens used anywhere on the response.
+function extractCannedTokensFromResponse(r: CannedResponse): string[] {
+  const seen = new Set<string>(extractCannedTokens(r.content))
+  for (const btn of r.buttons || []) {
+    for (const t of extractCannedTokens(btn.title || '')) seen.add(t)
+    for (const t of extractCannedTokens(btn.url || '')) seen.add(t)
+    for (const t of extractCannedTokens(btn.phone_number || '')) seen.add(t)
+  }
+  return Array.from(seen)
+}
+
+// Shared {{...}} resolver used by the body preview and the button fields, so
+// `{{phone_number}}` works inside a button URL the same way it does in content.
+function resolveCannedTokens(text: string): string {
+  if (!text) return text
+  const contact = contactsStore.currentContact
+  return text.replace(/\{\{\s*([\w.-]+)\s*\}\}/g, (_match, key: string) => {
+    if (key === 'contact_name') {
+      return contact?.profile_name || contact?.name || 'there'
+    }
+    if (key === 'phone_number') {
+      return contact?.phone_number || ''
+    }
+    if (key === 'user_name' || key === 'agent_name') {
+      return authStore.user?.full_name || ''
+    }
+    const value = cannedParamValues.value[key]
+    return value ? value : `{{${key}}}`
+  })
+}
+
+const cannedPreview = computed(() =>
+  selectedCannedResponse.value ? resolveCannedTokens(selectedCannedResponse.value.content) : '',
+)
+
+// Resolved buttons (with {{...}} substitution applied) for the dialog preview.
+// Empty array when no response is selected or it has no buttons.
+const cannedPreviewButtons = computed(() => {
+  const raw = selectedCannedResponse.value?.buttons || []
+  return raw.map(b => ({
+    ...b,
+    title: resolveCannedTokens(b.title),
+    ...(b.url !== undefined ? { url: resolveCannedTokens(b.url) } : {}),
+    ...(b.phone_number !== undefined ? { phone_number: resolveCannedTokens(b.phone_number) } : {}),
+  }))
+})
+
+function handleCannedSelect(response: CannedResponse) {
+  selectedCannedResponse.value = response
+  const tokens = extractCannedTokensFromResponse(response).filter(
+    t => !AUTO_RESOLVED_CANNED_TOKENS.has(t)
+  )
+  cannedParamNames.value = tokens
+  cannedParamValues.value = Object.fromEntries(tokens.map(t => [t, '']))
+  // Drop the slash command (or any stray text) so the textarea starts clean.
+  messageInput.value = ''
+  resetTextareaHeight()
   cannedPickerOpen.value = false
   cannedSearchQuery.value = ''
+  cannedDialogOpen.value = true
+}
+
+async function sendCannedResponse() {
+  if (!contactsStore.currentContact || !selectedCannedResponse.value) return
+
+  const missing = cannedParamNames.value.some(n => !cannedParamValues.value[n]?.trim())
+  if (missing) {
+    toast.error(t('chat.parameterRequired'))
+    return
+  }
+
+  const body = cannedPreview.value
+  const responseId = selectedCannedResponse.value.id
+  // Substitute {{...}} tokens in every button field — same rules as the body —
+  // so URLs like https://x.com/u/{{phone_number}} resolve at send time.
+  const buttons = (selectedCannedResponse.value.buttons || []).map(b => ({
+    ...b,
+    title: resolveCannedTokens(b.title),
+    ...(b.url !== undefined ? { url: resolveCannedTokens(b.url) } : {}),
+    ...(b.phone_number !== undefined ? { phone_number: resolveCannedTokens(b.phone_number) } : {}),
+  }))
+  const replyButtons = buttons.filter(b => !b.type || b.type === 'reply')
+  const urlButtons = buttons.filter(b => b.type === 'url')
+
+  // WhatsApp Cloud API supports: 1-3 reply buttons (interactive.button),
+  // 4-10 reply rows (interactive.list — backend's SendInteractiveButtons
+  // auto-picks the right shape), or a single cta_url. Phone buttons and
+  // multi-URL / mixed combos aren't representable; the detail-page validator
+  // blocks save for those, so the text fallback here is just a safety net.
+  let sendType: 'text' | 'interactive' = 'text'
+  let interactive: {
+    type: 'button' | 'list' | 'cta_url'
+    body: string
+    buttons?: Array<{ id: string; title: string }>
+    button_text?: string
+    url?: string
+  } | undefined
+
+  if (buttons.length > 0 && replyButtons.length === buttons.length && replyButtons.length <= 10) {
+    sendType = 'interactive'
+    interactive = {
+      type: replyButtons.length <= 3 ? 'button' : 'list',
+      body,
+      buttons: replyButtons.map(b => ({ id: b.id, title: b.title })),
+    }
+  } else if (buttons.length === 1 && urlButtons.length === 1) {
+    sendType = 'interactive'
+    interactive = {
+      type: 'cta_url',
+      body,
+      button_text: urlButtons[0].title,
+      url: urlButtons[0].url || '',
+    }
+  }
+
+  isSendingCanned.value = true
+  try {
+    await contactsStore.sendMessage(
+      contactsStore.currentContact.id,
+      sendType,
+      sendType === 'interactive' ? { body } : { body },
+      contactsStore.replyingTo?.id,
+      selectedAccount.value || undefined,
+      interactive ? { interactive } : undefined,
+    )
+    cannedResponsesService.use(responseId).catch(() => {})
+    contactsStore.clearReplyingTo()
+    cannedDialogOpen.value = false
+    selectedCannedResponse.value = null
+    cannedParamNames.value = []
+    cannedParamValues.value = {}
+    await nextTick()
+    scrollToBottom()
+  } catch (error) {
+    toast.error(t('chat.sendMessageFailed'))
+  } finally {
+    isSendingCanned.value = false
+  }
 }
 
 function closeCannedPicker() {
@@ -2140,10 +2298,9 @@ async function sendMediaMessage() {
               <TooltipTrigger as-child>
                 <span>
                   <CannedResponsePicker
-                    :contact="contactsStore.currentContact"
                     :external-open="cannedPickerOpen"
                     :external-search="cannedSearchQuery"
-                    @select="insertCannedResponse"
+                    @select="handleCannedSelect"
                     @close="closeCannedPicker"
                   />
                 </span>
@@ -2274,6 +2431,51 @@ async function sendMediaMessage() {
             <Loader2 v-if="isSendingTemplate" class="h-4 w-4 mr-2 animate-spin" />
             {{ $t('chat.send') }}
           </Button>
+        </div>
+      </DialogContent>
+    </Dialog>
+
+    <!-- Canned Response Preview Dialog -->
+    <Dialog v-model:open="cannedDialogOpen">
+      <DialogContent class="max-w-sm">
+        <!-- DialogContent doesn't forward $attrs (multi-root via DialogPortal),
+             so wrap the body in a div carrying the stable id used by e2e. -->
+        <div id="canned-response-dialog">
+        <DialogHeader>
+          <DialogTitle>{{ cannedParamNames.length > 0 ? $t('chat.fillParameters') : $t('chat.preview') }}</DialogTitle>
+          <DialogDescription>
+            {{ selectedCannedResponse?.name }}
+          </DialogDescription>
+        </DialogHeader>
+        <div class="py-4 space-y-3">
+          <div v-for="param in cannedParamNames" :key="param" class="space-y-1">
+            <label class="text-sm font-medium" :for="`canned-response-param-${param}`">{{ param }}</label>
+            <Input
+              :id="`canned-response-param-${param}`"
+              v-model="cannedParamValues[param]"
+              :placeholder="param"
+              class="h-9 canned-response-param"
+            />
+          </div>
+          <div v-if="cannedPreview || cannedPreviewButtons.length" class="space-y-1">
+            <label class="text-xs font-medium text-muted-foreground">{{ $t('chat.preview') }}</label>
+            <div id="canned-response-preview" class="chat-bubble chat-bubble-outgoing ml-auto" style="max-width: 100%;">
+              <span v-if="cannedPreview" class="whitespace-pre-wrap break-words text-sm">{{ cannedPreview }}</span>
+              <PreviewButtonGroup
+                v-if="cannedPreviewButtons.length"
+                :buttons="cannedPreviewButtons"
+                disabled
+              />
+            </div>
+          </div>
+        </div>
+        <div class="flex justify-end gap-2">
+          <Button id="canned-response-cancel" variant="outline" @click="cannedDialogOpen = false">{{ $t('common.cancel') }}</Button>
+          <Button id="canned-response-send" :disabled="isSendingCanned" @click="sendCannedResponse">
+            <Loader2 v-if="isSendingCanned" class="h-4 w-4 mr-2 animate-spin" />
+            {{ $t('chat.send') }}
+          </Button>
+        </div>
         </div>
       </DialogContent>
     </Dialog>
